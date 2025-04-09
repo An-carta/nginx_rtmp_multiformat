@@ -45,6 +45,7 @@ typedef struct {
 typedef struct {
     ngx_str_t                           suffix;
     ngx_array_t                         args;
+    ngx_str_t                           format;  // Added format
 } ngx_rtmp_hls_variant_t;
 
 
@@ -365,30 +366,38 @@ ngx_rtmp_hls_multiformat(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     // Check if the multiformat feature is enabled
     if (ngx_strcmp(value[1].data, "on") == 0) {
         hacf->enable_multiformat = 1;
+        ngx_log_error(NGX_LOG_INFO, cf->log, 0, "HLS multiformat enabled.");
     } else {
         hacf->enable_multiformat = 0;
+        ngx_log_error(NGX_LOG_INFO, cf->log, 0, "HLS multiformat disabled.");
+    }
+
+    // Ensure there are formats specified after the "on" argument
+    if (hacf->enable_multiformat && cf->args->nelts < 3) {
+        ngx_log_error(NGX_LOG_ERR, cf->log, 0, "No formats specified for multiformat.");
+        return NGX_CONF_ERROR;
     }
 
     // Initialize the formats array if it's not already initialized
     if (hacf->formats == NULL) {
-        hacf->formats = ngx_array_create(cf->pool, 1, sizeof(ngx_str_t));  // Allocate memory
+        hacf->formats = ngx_array_create(cf->pool, cf->args->nelts - 2, sizeof(ngx_str_t));  // Allocate memory
         if (hacf->formats == NULL) {
             return NGX_CONF_ERROR;
         }
     }
 
-    // Store formats passed in the configuration
+    // Store formats passed in the configuration (after "on/off")
     for (i = 2; i < cf->args->nelts; ++i) {
         ngx_str_t *fmt = ngx_array_push(hacf->formats);
         if (fmt == NULL) {
             return NGX_CONF_ERROR;
         }
         *fmt = value[i];  // Assign the format string
+        ngx_log_error(NGX_LOG_INFO, cf->log, 0, "Format added: %V", fmt);  // Log each added format
     }
 
     return NGX_CONF_OK;
 }
-
 
 static ngx_rtmp_hls_frag_t *
 ngx_rtmp_hls_get_frag(ngx_rtmp_session_t *s, ngx_int_t n)
@@ -1333,6 +1342,20 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
         goto next;
     }
 
+    // check directive
+    if (hacf->enable_multiformat && hacf->formats && hacf->formats->nelts > 0) {
+        ngx_uint_t i;
+        ngx_str_t *fmt = hacf->formats->elts;
+    
+        for (i = 0; i < hacf->formats->nelts; i++) {
+            ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                          "hls: multiformat enabled, processing format: %V", &fmt[i]);
+    
+            // Here you'll add logic to fork a transcoding process per format (FFmpeg call)
+            // You can call an external function like ngx_rtmp_hls_start_transcode(s, &fmt[i]);
+        }
+    }
+
     if (s->auto_pushed) {
         goto next;
     }
@@ -1518,6 +1541,8 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
 next:
     return next_publish(s, v);
 }
+
+
 static ngx_int_t
 ngx_rtmp_hls_close_stream(ngx_rtmp_session_t *s, ngx_rtmp_close_stream_t *v)
 {
