@@ -10,6 +10,12 @@
 #include <ngx_rtmp_cmd_module.h>
 #include <ngx_rtmp_codec_module.h>
 #include "ngx_rtmp_mpegts.h"
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <pwd.h>
+#include <grp.h>
+#include <unistd.h>
 
 
 static ngx_rtmp_publish_pt              next_publish;
@@ -17,6 +23,9 @@ static ngx_rtmp_close_stream_pt         next_close_stream;
 static ngx_rtmp_stream_begin_pt         next_stream_begin;
 static ngx_rtmp_stream_eof_pt           next_stream_eof;
 
+
+static void
+ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format);     // helper function called in publish to transcode
 static char *
 ngx_rtmp_hls_multiformat(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);   // added handler function
 static char * ngx_rtmp_hls_variant(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -1256,6 +1265,16 @@ ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s, ngx_str_t *path)
             return NGX_ERROR;
         }
 
+        // Set ownership to nobody:nogroup
+        struct passwd *pwd = getpwnam("nobody");
+        struct group  *grp = getgrnam("nogroup");
+        if (pwd && grp) {
+            chown((const char *)zpath, pwd->pw_uid, grp->gr_gid);
+        } else {
+            ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                          "hls: failed to find user/group nobody:nogroup");
+        }
+
         ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                        "hls: directory '%V' created", path);
 
@@ -1318,6 +1337,16 @@ ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s, ngx_str_t *path)
         return NGX_ERROR;
     }
 
+    // Set ownership to nobody:nogroup
+    struct passwd *pwd2 = getpwnam("nobody");
+    struct group  *grp2 = getgrnam("nogroup");
+    if (pwd2 && grp2) {
+        chown((const char *)zpath, pwd2->pw_uid, grp2->gr_gid);
+    } else {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                      "hls: failed to find user/group nobody:nogroup");
+    }
+
     ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "hls: directory '%s' created", zpath);
 
@@ -1325,9 +1354,108 @@ ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s, ngx_str_t *path)
 }
 
 
+static void
+ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format)
+{
+    ngx_rtmp_hls_ctx_t *ctx;
+    u_char full_path_buf[NGX_MAX_PATH];
+    ngx_str_t full_output_path;
+    u_char base_path_buf[NGX_MAX_PATH];
+    ngx_str_t base_output_path;
+
+    // Get the stream context
+    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
+    if (ctx == NULL || ctx->name.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                      "hls: no context available for session (or stream name missing)");
+        return;
+    }
+
+    // First, ensure that the base directory /tmp/hls_output/<stream_name> exists
+    base_output_path.len = ngx_snprintf(base_path_buf, sizeof(base_path_buf),
+                                        "/tmp/hls_output/%V%Z", &ctx->name)
+                           - base_path_buf;
+    base_output_path.data = base_path_buf;
+    if (ngx_rtmp_hls_ensure_directory(s, &base_output_path) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                      "hls: failed to create base output directory %V", &base_output_path);
+        return;
+    }
+
+    // Build full output path: /tmp/hls_output/<stream_name>/<format>/
+    full_output_path.len = ngx_snprintf(full_path_buf, sizeof(full_path_buf),
+                                        "/tmp/hls_output/%V/%V%Z", &ctx->name, format)
+                           - full_path_buf;
+    full_output_path.data = full_path_buf;
+
+    // Ensure the format subdirectory exists
+    if (ngx_rtmp_hls_ensure_directory(s, &full_output_path) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                      "hls: failed to create output directory %V", &full_output_path);
+        return;
+    }
+
+    // Now, we are ready to fork and exec FFmpeg.
+    pid_t pid = fork();
+    if (pid == -1) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
+                      "hls: fork() failed");
+        return;
+    }
+
+    if (pid == 0) {  // Child process
+        u_char input_buf[NGX_MAX_PATH];
+
+        // Build the input RTMP URL: "rtmp://localhost:1935/live/<stream_name>"
+        ngx_snprintf(input_buf, sizeof(input_buf), "rtmp://localhost:1935/live/%V%Z", &ctx->name);
+        char *input = (char *) input_buf;
+
+        // Use full_output_path as the directory for this format.
+        // Build the output file path for the HLS playlist file. For example:
+        // "/tmp/hls_output/<stream_name>/<format>/out.m3u8"
+        char *outfile = (char *) ngx_pnalloc(s->connection->pool, NGX_MAX_PATH);
+        if (outfile == NULL) {
+            ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                          "hls: memory allocation failed for output file");
+            exit(1);
+        }
+        ngx_snprintf((u_char *)outfile, NGX_MAX_PATH, "%s/out.m3u8%Z", full_output_path.data);
+
+        // Log the command that will be executed (for debugging)
+        ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                      "hls: executing command: ffmpeg -i %s -c:v libx264 -c:a aac -strict -2 -f hls %s",
+                      input, outfile);
+
+        // Build the argument list for execvp()
+        char *argv[] = {
+            "/usr/local/bin/ffmpeg_custom",
+            "-i", input,             // Input RTMP stream
+            "-c:v", "libx264",       // Video codec
+            "-c:a", "aac",           // Audio codec
+            "-strict", "-2",         // Allow non-strict codecs
+            "-f", "hls",             // HLS output format
+            outfile,                 // Output playlist file (HLS manifest)
+            NULL
+        };
+
+        execvp("/usr/local/bin/ffmpeg_custom", argv);
+
+        // If execvp returns, it has failed.
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
+                      "hls: execvp() failed");
+        exit(1);
+    }
+
+    // Parent process continues
+    ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                  "hls: started transcoding for format %V (pid: %P)", format, pid);
+}
+
+
+
 static ngx_int_t
 ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
-{
+{ 
     ngx_rtmp_hls_app_conf_t        *hacf;
     ngx_rtmp_hls_ctx_t             *ctx;
     u_char                         *p, *pp;
@@ -1340,20 +1468,6 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
     hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
     if (hacf == NULL || !hacf->hls || hacf->path.len == 0) {
         goto next;
-    }
-
-    // check directive
-    if (hacf->enable_multiformat && hacf->formats && hacf->formats->nelts > 0) {
-        ngx_uint_t i;
-        ngx_str_t *fmt = hacf->formats->elts;
-    
-        for (i = 0; i < hacf->formats->nelts; i++) {
-            ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
-                          "hls: multiformat enabled, processing format: %V", &fmt[i]);
-    
-            // Here you'll add logic to fork a transcoding process per format (FFmpeg call)
-            // You can call an external function like ngx_rtmp_hls_start_transcode(s, &fmt[i]);
-        }
     }
 
     if (s->auto_pushed) {
@@ -1408,6 +1522,7 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
         return NGX_ERROR;
     }
 
+    
     *ngx_cpymem(ctx->name.data, v->name, ctx->name.len) = 0;
 
     len = hacf->path.len + 1 + ctx->name.len + sizeof(".m3u8");
@@ -1437,6 +1552,20 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
 
     ngx_memcpy(ctx->stream.data, ctx->playlist.data, ctx->stream.len - 1);
     ctx->stream.data[ctx->stream.len - 1] = (hacf->nested ? '/' : '-');
+
+    // check directive
+    if (hacf->enable_multiformat && hacf->formats && hacf->formats->nelts > 0) {
+        ngx_uint_t i;
+        ngx_str_t *fmt = hacf->formats->elts;
+    
+        for (i = 0; i < hacf->formats->nelts; i++) {
+            ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                          "hls: multiformat enabled, processing format: %V", &fmt[i]);
+        
+            ngx_rtmp_hls_start_transcode(s, &fmt[i]);
+        }
+    }
+
 
     /* varint playlist path */
 
