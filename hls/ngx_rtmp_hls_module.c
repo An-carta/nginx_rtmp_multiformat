@@ -16,6 +16,12 @@
 #include <pwd.h>
 #include <grp.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <ngx_log.h>
+#include <ngx_rtmp.h>
 
 
 static ngx_rtmp_publish_pt              next_publish;
@@ -23,7 +29,8 @@ static ngx_rtmp_close_stream_pt         next_close_stream;
 static ngx_rtmp_stream_begin_pt         next_stream_begin;
 static ngx_rtmp_stream_eof_pt           next_stream_eof;
 
-
+static ngx_int_t
+generate_master_playlist(ngx_rtmp_session_t *s); // function to create master file
 static void
 ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format);     // helper function called in publish to transcode
 static char *
@@ -1354,6 +1361,57 @@ ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s, ngx_str_t *path)
 }
 
 
+/*
+ * This function generates a master playlist at "/tmp/hls/master.m3u8".
+ * It assumes that the variant playlists are placed in subdirectories named
+ * exactly as the variant strings (e.g., "360p/out.m3u8" relative to the master).
+ */
+static ngx_int_t
+generate_master_playlist(ngx_rtmp_session_t *s)
+{
+    FILE *fp = fopen("/var/hls/master.m3u8", "w");
+    if (fp == NULL) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
+                      "hls: failed to open /var/hls/master.m3u8 for writing");
+        return NGX_ERROR;
+    }
+    
+    // Write M3U8 header
+    fprintf(fp, "#EXTM3U\n");
+    
+    // Retrieve stream name from context
+    ngx_rtmp_hls_ctx_t *ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
+    if (ctx == NULL || ctx->name.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                      "hls: cannot generate master playlist, stream name missing");
+        fclose(fp);
+        return NGX_ERROR;
+    }
+    
+    // Convert stream name to a C-string (assumes null-termination or copy into buffer)
+    char *stream_name = (char *) ctx->name.data;
+
+    // Original 1080p stream entry
+    fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080\n");
+    fprintf(fp, "%s/index.m3u8\n", stream_name);
+    
+    // Transcoded variants
+    fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n");
+    fprintf(fp, "%s/360p/out.m3u8\n", stream_name);
+    
+    fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n");
+    fprintf(fp, "%s/480p/out.m3u8\n", stream_name);
+    
+    fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\n");
+    fprintf(fp, "%s/720p/out.m3u8\n", stream_name);
+    
+    fclose(fp);
+    
+    ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                  "hls: master playlist generated at /var/hls/master.m3u8");
+    return NGX_OK;
+}
+
 static void
 ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format)
 {
@@ -1362,18 +1420,34 @@ ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format)
     ngx_str_t full_output_path;
     u_char base_path_buf[NGX_MAX_PATH];
     ngx_str_t base_output_path;
+    char *scale = NULL; // will hold the scale value for ffmpeg
 
     // Get the stream context
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
     if (ctx == NULL || ctx->name.len == 0) {
         ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
-                      "hls: no context available for session (or stream name missing)");
+                      "hls: no context available for session (or empty stream name)");
         return;
     }
 
-    // First, ensure that the base directory /tmp/hls_output/<stream_name> exists
+    // Determine the desired video resolution based on format value (case-insensitive)
+    if (ngx_strcasecmp(format->data, (u_char *)"1080p") == 0) {
+        scale = "1920:1080";
+    } else if (ngx_strcasecmp(format->data, (u_char *)"720p") == 0) {
+        scale = "1280:720";
+    } else if (ngx_strcasecmp(format->data, (u_char *)"480p") == 0) {
+        scale = "854:480";    // You might also use "640:480" depending on your needs
+    } else if (ngx_strcasecmp(format->data, (u_char *)"360p") == 0) {
+        scale = "640:360";
+    } else {
+        // Fallback: if the format doesn't match a known resolution, use no scaling.
+        // You could alternatively set a default resolution.
+        scale = "1920:1080";
+    }
+
+    // Ensure the base directory /tmp/hls_output/<stream_name> exists
     base_output_path.len = ngx_snprintf(base_path_buf, sizeof(base_path_buf),
-                                        "/tmp/hls_output/%V%Z", &ctx->name)
+                                        "/var/hls/%V%Z", &ctx->name)
                            - base_path_buf;
     base_output_path.data = base_path_buf;
     if (ngx_rtmp_hls_ensure_directory(s, &base_output_path) != NGX_OK) {
@@ -1382,20 +1456,18 @@ ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format)
         return;
     }
 
-    // Build full output path: /tmp/hls_output/<stream_name>/<format>/
+    // Build the full output path: /tmp/hls_output/<stream_name>/<format>/
     full_output_path.len = ngx_snprintf(full_path_buf, sizeof(full_path_buf),
-                                        "/tmp/hls_output/%V/%V%Z", &ctx->name, format)
+                                        "/var/hls/%V/%V%Z", &ctx->name, format)
                            - full_path_buf;
     full_output_path.data = full_path_buf;
-
-    // Ensure the format subdirectory exists
     if (ngx_rtmp_hls_ensure_directory(s, &full_output_path) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
                       "hls: failed to create output directory %V", &full_output_path);
         return;
     }
 
-    // Now, we are ready to fork and exec FFmpeg.
+    // Fork a new process for transcoding
     pid_t pid = fork();
     if (pid == -1) {
         ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
@@ -1403,44 +1475,52 @@ ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format)
         return;
     }
 
-    if (pid == 0) {  // Child process
+    if (pid == 0) {  // Child process begins here
         u_char input_buf[NGX_MAX_PATH];
 
-        // Build the input RTMP URL: "rtmp://localhost:1935/live/<stream_name>"
+        // Build the RTMP input URL: "rtmp://localhost:1935/live/<stream_name>"
         ngx_snprintf(input_buf, sizeof(input_buf), "rtmp://localhost:1935/live/%V%Z", &ctx->name);
         char *input = (char *) input_buf;
 
-        // Use full_output_path as the directory for this format.
-        // Build the output file path for the HLS playlist file. For example:
-        // "/tmp/hls_output/<stream_name>/<format>/out.m3u8"
+        // The output directory is already in full_output_path.data (e.g., /tmp/hls_output/teststream45/mp4/)
+        // Allocate memory for the output file path for the HLS playlist.
         char *outfile = (char *) ngx_pnalloc(s->connection->pool, NGX_MAX_PATH);
         if (outfile == NULL) {
             ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
-                          "hls: memory allocation failed for output file");
+                          "hls: memory allocation failed for outfile");
             exit(1);
         }
+        // Build the output file path for the playlist: e.g., /tmp/hls_output/<stream_name>/<format>/out.m3u8
         ngx_snprintf((u_char *)outfile, NGX_MAX_PATH, "%s/out.m3u8%Z", full_output_path.data);
 
-        // Log the command that will be executed (for debugging)
+        // Log the command that will be executed
         ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
-                      "hls: executing command: ffmpeg -i %s -c:v libx264 -c:a aac -strict -2 -f hls %s",
-                      input, outfile);
+                      "hls: executing command: /home/antonio/bin/ffmpeg -i %s -vf scale=%s -c:v libx264 -c:a aac -strict -2 -hls_time 4 -hls_list_size 5 -hls_flags delete_segments -f hls %s",
+                      input, scale, outfile);
+        
+        char scaling_filter[64];
+        ngx_snprintf((u_char *)scaling_filter, sizeof(scaling_filter), "scale=%s%Z", scale);
 
-        // Build the argument list for execvp()
+        // Build the argument list for execvp() with additional options for scaling and automatic cleanup:
         char *argv[] = {
-            "/usr/local/bin/ffmpeg_custom",
-            "-i", input,             // Input RTMP stream
-            "-c:v", "libx264",       // Video codec
-            "-c:a", "aac",           // Audio codec
-            "-strict", "-2",         // Allow non-strict codecs
-            "-f", "hls",             // HLS output format
-            outfile,                 // Output playlist file (HLS manifest)
+            "/home/antonio/bin/ffmpeg", // use your custom ffmpeg binary if needed
+            "-i", input,                // input RTMP stream
+            "-vf", scaling_filter,               // set scaling filter to desired resolution, e.g., scale=1280:720
+            "-c:v", "libx264",          // video codec
+            "-c:a", "aac",              // audio codec
+            "-strict", "-2",            // allow experimental codecs
+            "-hls_time", "4",           // segment duration (seconds)
+            "-hls_list_size", "5",      // number of segments in playlist
+            "-hls_flags", "delete_segments", // automatically delete older segments
+            "-f", "hls",                // output format HLS
+            outfile,                    // output playlist file
             NULL
         };
 
-        execvp("/usr/local/bin/ffmpeg_custom", argv);
+        // Execute FFmpeg
+        execvp(argv[0], argv);
 
-        // If execvp returns, it has failed.
+        // If execvp fails, log the error and exit
         ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
                       "hls: execvp() failed");
         exit(1);
@@ -1450,7 +1530,6 @@ ngx_rtmp_hls_start_transcode(ngx_rtmp_session_t *s, ngx_str_t *format)
     ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
                   "hls: started transcoding for format %V (pid: %P)", format, pid);
 }
-
 
 
 static ngx_int_t
@@ -1665,6 +1744,11 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
 
     if (hacf->continuous) {
         ngx_rtmp_hls_restore_stream(s);
+    }
+
+    if (generate_master_playlist(s) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                      "hls: failed to generate master playlist");
     }
 
 next:
