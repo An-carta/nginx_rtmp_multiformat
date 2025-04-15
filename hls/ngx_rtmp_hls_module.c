@@ -1369,46 +1369,56 @@ ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s, ngx_str_t *path)
 static ngx_int_t
 generate_master_playlist(ngx_rtmp_session_t *s)
 {
-    FILE *fp = fopen("/var/hls/master.m3u8", "w");
-    if (fp == NULL) {
-        ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
-                      "hls: failed to open /var/hls/master.m3u8 for writing");
-        return NGX_ERROR;
-    }
-    
-    // Write M3U8 header
-    fprintf(fp, "#EXTM3U\n");
-    
-    // Retrieve stream name from context
+    // Retrieve stream context to get the stream name.
     ngx_rtmp_hls_ctx_t *ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
     if (ctx == NULL || ctx->name.len == 0) {
         ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
                       "hls: cannot generate master playlist, stream name missing");
-        fclose(fp);
         return NGX_ERROR;
     }
     
-    // Convert stream name to a C-string (assumes null-termination or copy into buffer)
+    // Convert stream name to a C-string.
+    // (Assumes ctx->name.data is null-terminated or already valid as a C-string.)
     char *stream_name = (char *) ctx->name.data;
-
-    // Original 1080p stream entry
+    
+    // Build master playlist file path: /var/hls/<stream_name>/master.m3u8
+    char master_path[NGX_MAX_PATH];
+    ngx_snprintf((u_char *) master_path, sizeof(master_path),
+                 "/var/hls/%s/master.m3u8%Z", stream_name);
+    
+    FILE *fp = fopen(master_path, "w");
+    if (fp == NULL) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
+                      "hls: failed to open %s for writing", master_path);
+        return NGX_ERROR;
+    }
+    
+    // Write the master playlist header.
+    fprintf(fp, "#EXTM3U\n");
+    
+    // Write an entry for the original 1080p stream.
+    // Here, we assume the original playlist is generated as "index.m3u8" 
+    // inside the stream directory, i.e., /var/hls/<stream_name>/index.m3u8.
     fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080\n");
-    fprintf(fp, "%s/index.m3u8\n", stream_name);
+    fprintf(fp, "index.m3u8\n");
     
-    // Transcoded variants
+    // Write variant entries for transcoded streams.
+    // For 360p:
     fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n");
-    fprintf(fp, "%s/360p/out.m3u8\n", stream_name);
+    fprintf(fp, "360p/out.m3u8\n");
     
+    // For 480p:
     fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n");
-    fprintf(fp, "%s/480p/out.m3u8\n", stream_name);
+    fprintf(fp, "480p/out.m3u8\n");
     
+    // For 720p:
     fprintf(fp, "#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\n");
-    fprintf(fp, "%s/720p/out.m3u8\n", stream_name);
-    
+    fprintf(fp, "720p/out.m3u8\n");
+
     fclose(fp);
     
     ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
-                  "hls: master playlist generated at /var/hls/master.m3u8");
+                  "hls: master playlist generated at %s", master_path);
     return NGX_OK;
 }
 
