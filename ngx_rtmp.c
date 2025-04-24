@@ -10,6 +10,8 @@
 #include <nginx.h>
 #include "ngx_rtmp.h"
 
+// added extern
+extern void ngx_rtsp_init_connection(ngx_connection_t *c);
 
 static char *ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_rtmp_add_ports(ngx_conf_t *cf, ngx_array_t *ports,
@@ -626,7 +628,44 @@ ngx_rtmp_optimize_servers(ngx_conf_t *cf, ngx_array_t *ports)
             }
 
             ls->addr_ntop = 1;
-            ls->handler = ngx_rtmp_init_connection;
+            
+            //modified by me 
+            
+            /* ── INSERT THIS PORT CHECK ── */
+            if (ls->sockaddr->sa_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *) ls->sockaddr;
+                ngx_uint_t          port = ntohs(sin->sin_port);
+
+                if (port == 554) {
+                    ngx_log_error(NGX_LOG_ERR, cf->log, 0,
+                                "Using RTSP init handler on port %ui", port);
+                        ls->handler = ngx_rtsp_init_connection;
+                }
+                else {
+                    ls->handler = ngx_rtmp_init_connection;
+                }
+            }
+            #if (NGX_HAVE_INET6)
+            else if (ls->sockaddr->sa_family == AF_INET6) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) ls->sockaddr;
+            ngx_uint_t           port6 = ntohs(sin6->sin6_port);
+
+                if (port6 == 554) {
+                    ngx_log_error(NGX_LOG_ERR, cf->log, 0,
+                                "Using RTSP init handler on port %ui", port6);
+                    ls->handler = ngx_rtsp_init_connection;
+                }
+                else {
+                    ls->handler = ngx_rtmp_init_connection;
+                }
+            }
+            #endif
+            else {
+                ls->handler = ngx_rtmp_init_connection;
+            }
+            /* ── END PORT CHECK ── */
+
+
             ls->pool_size = 4096;
 
             /* TODO: error_log directive */

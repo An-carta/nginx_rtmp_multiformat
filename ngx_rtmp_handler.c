@@ -8,6 +8,7 @@
 #include <ngx_core.h>
 #include "ngx_rtmp.h"
 #include "ngx_rtmp_amf.h"
+#include <ngx_event.h>
 
 
 static void ngx_rtmp_recv(ngx_event_t *rev);
@@ -15,6 +16,15 @@ static void ngx_rtmp_send(ngx_event_t *rev);
 static void ngx_rtmp_ping(ngx_event_t *rev);
 static ngx_int_t ngx_rtmp_finalize_set_chunk_size(ngx_rtmp_session_t *s);
 
+static void ngx_rtsp_recv(ngx_event_t *rev);        // added function
+void ngx_rtsp_init_connection(ngx_connection_t *c); //added function
+static void ngx_rtsp_handle_options(ngx_connection_t *c, int cseq);
+static void ngx_rtsp_handle_describe(ngx_connection_t *c, int cseq, const char *uri);
+static void ngx_rtsp_send_simple_response(ngx_connection_t *c,
+    int               cseq,
+    int               code,
+    const char       *reason,
+    const char       *extra_headers);
 
 ngx_uint_t                  ngx_rtmp_naccepted;
 
@@ -188,6 +198,154 @@ ngx_rtmp_ping(ngx_event_t *pev)
     ngx_add_timer(pev, cscf->ping_timeout);
 }
 
+
+// adding function
+
+/* Called when someone connects on port 554 */
+void
+ngx_rtsp_init_connection(ngx_connection_t *c)
+{
+    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                  ">>> RTSP INIT CONNECTION <<<");
+
+    /* Install our RTSP read handler */
+    c->data = NULL;  /* no session struct */
+    c->read->handler = ngx_rtsp_recv;
+
+    /* Tell NGINX to invoke ngx_rtsp_recv() when there’s data */
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0, "RTSP: ngx_handle_read_event failed");
+        ngx_close_connection(c);
+    }
+}
+
+//added function
+
+static void
+ngx_rtsp_send_simple_response(ngx_connection_t *c,
+                              int               cseq,
+                              int               code,
+                              const char       *reason,
+                              const char       *extra_headers)
+{
+    u_char  hdr[256];
+    size_t  hlen;
+
+    hlen = ngx_snprintf(hdr, sizeof(hdr),
+        "RTSP/1.0 %d %s\r\n"
+        "CSeq: %d\r\n"
+        "%s"
+        "\r\n",
+        code, reason, cseq,
+        extra_headers ? extra_headers : ""
+    ) - hdr;
+
+    c->send(c, hdr, hlen);
+}
+
+// function to handle options
+
+// OPTIONS: advertise which methods we support
+static void
+ngx_rtsp_handle_options(ngx_connection_t *c, int cseq)
+{
+    const char *hdrs =
+        "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n";
+    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", hdrs);
+}
+
+// function to handle describe
+
+// DESCRIBE: return a tiny SDP payload
+static void
+ngx_rtsp_handle_describe(ngx_connection_t *c, int cseq, const char *uri)
+{
+    static const char *sdp =
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 127.0.0.1\r\n"
+        "s=nginx-rtsp\r\n"
+        "t=0 0\r\n"
+        "a=control:*\r\n"
+        "m=video 0 RTP/AVP 96\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=control:trackID=0\r\n";
+
+    /* Build headers (no blank line yet) */
+    char extra[256];
+
+    ngx_snprintf((u_char*)extra, sizeof(extra),
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: %uz\r\n",
+        ngx_strlen(sdp));
+
+    /* Send the RTSP status + headers + blank line */
+    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", extra);
+    c->send(c, (u_char*)"\r\n", 2);
+
+    /* Send the SDP body */
+    c->send(c, (u_char*)sdp, ngx_strlen(sdp));
+}
+
+
+// added function
+
+/* Reads raw RTSP request, logs it, and sends back a placeholder */
+static void
+ngx_rtsp_recv(ngx_event_t *rev)
+{
+    ngx_connection_t *c = rev->data;
+    u_char            buf[4096];
+    ssize_t           n;
+
+    if (rev->timedout) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0, "RTSP: recv timeout");
+        ngx_close_connection(c);
+        return;
+    }
+
+    /* read into buf, leaving space for ’\0’ */
+    n = c->recv(c, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        ngx_close_connection(c);
+        return;
+    }
+
+    /* safely clamp and null-terminate */
+    {
+        ssize_t max = sizeof(buf) - 1;
+        ssize_t idx = n < max ? n : max;
+        buf[idx] = '\0';
+    }
+
+    /* parse the first line */
+    char *line   = (char*) buf;
+    char *method = strsep(&line, " ");
+    char *uri    = strsep(&line, " ");
+    strsep(&line, "\r\n");  /* drop the version, no need to store */
+
+    /* parse CSeq */
+    char *cseq_hdr = strstr((char*)buf, "\r\nCSeq:");
+    int cseq = 0;
+
+    int cseq = cseq_hdr ? atoi(cseq_hdr + 6) : 0;
+
+    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                  "RTSP: method='%s' uri='%s' CSeq=%d",
+                  method, uri, cseq);
+
+    if (strcmp(method, "OPTIONS") == 0) {
+        ngx_rtsp_handle_options(c, cseq);
+    }
+    else if (strcmp(method, "DESCRIBE") == 0) {
+        ngx_rtsp_handle_describe(c, cseq, uri);
+    }
+    else {
+        ngx_rtsp_send_simple_response(c, cseq, 501,
+                                      "Not Implemented", NULL);
+    }
+
+    ngx_close_connection(c);
+}
 
 static void
 ngx_rtmp_recv(ngx_event_t *rev)
