@@ -303,31 +303,41 @@ ngx_rtsp_recv(ngx_event_t *rev)
         return;
     }
 
-    /* read into buf, leaving space for ’\0’ */
     n = c->recv(c, buf, sizeof(buf) - 1);
     if (n <= 0) {
         ngx_close_connection(c);
         return;
     }
 
-    /* safely clamp and null-terminate */
+    /* clamp + null-terminate */
     {
-        ssize_t max = sizeof(buf) - 1;
+        ssize_t max = (ssize_t) (sizeof(buf) - 1);
         ssize_t idx = n < max ? n : max;
         buf[idx] = '\0';
     }
 
-    /* parse the first line */
+    /* locate the CSeq header line anywhere */
+    char *cseq_hdr = strstr((char *) buf, "\r\nCSeq:");
+    int   cseq     = 0;
+    if (cseq_hdr) {
+        /* find the ':' then skip whitespace to the number */
+        char *colon = strchr(cseq_hdr, ':');
+        if (colon) {
+            /* skip ':' and any spaces/tabs */
+            char *val = colon + 1;
+            while (*val == ' ' || *val == '\t') {
+                val++;
+            }
+            cseq = atoi(val);
+        }
+    }
+    
+    /* parse the request-line */
     char *line   = (char*) buf;
     char *method = strsep(&line, " ");
     char *uri    = strsep(&line, " ");
-    strsep(&line, "\r\n");  /* drop the version, no need to store */
+    strsep(&line, "\r\n");  /* skip version */
 
-    /* parse CSeq */
-    char *cseq_hdr = strstr((char*)buf, "\r\nCSeq:");
-    int cseq = 0;
-
-    int cseq = cseq_hdr ? atoi(cseq_hdr + 6) : 0;
 
     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                   "RTSP: method='%s' uri='%s' CSeq=%d",
@@ -346,6 +356,7 @@ ngx_rtsp_recv(ngx_event_t *rev)
 
     ngx_close_connection(c);
 }
+
 
 static void
 ngx_rtmp_recv(ngx_event_t *rev)
