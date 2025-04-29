@@ -12,13 +12,21 @@
 
 // Defined RTSP session struct
 typedef struct {
-    int   session_id;        /* a small random or monotonic ID */
-    int   client_port_lo;
-    int   client_port_hi;
-    int   server_port_lo;
-    int   server_port_hi;
-    uint16_t rtp_seq;
-    uint32_t rtp_ts;
+    int          session_id;      /* a small random or monotonic ID */
+
+    /* (if you ever use UDP fallback, you can keep these) */
+    int          client_port_lo;
+    int          client_port_hi;
+    int          server_port_lo;
+    int          server_port_hi;
+
+    uint16_t     rtp_seq;
+    uint32_t     rtp_ts;
+
+    /* << NEW fields to support TCP‐interleaved RTP • MUST be here! >> */
+    u_char       rtp_channel;     /* “0” from interleaved=0-1 */
+    u_char       rtcp_channel;    /* “1” from interleaved=0-1 */
+    ngx_event_t  rtp_event;       /* your 40 ms timer event */
 } ngx_rtsp_session_t;
 
 
@@ -216,6 +224,9 @@ ngx_rtmp_ping(ngx_event_t *pev)
 void
 ngx_rtsp_init_connection(ngx_connection_t *c)
 {
+    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          ">>> RTSP INIT CONNECTION fired, fd=%d  <<<", c->fd);
+
     ngx_rtsp_session_t *rs;
 
     ngx_log_error(NGX_LOG_ERR, c->log, 0,
@@ -225,6 +236,8 @@ ngx_rtsp_init_connection(ngx_connection_t *c)
     rs = ngx_pcalloc(c->pool, sizeof(*rs));
     if (rs == NULL) {
         ngx_close_connection(c);
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "FAILED to allocate RTSP session state");
         return;
     }
 
@@ -232,6 +245,9 @@ ngx_rtsp_init_connection(ngx_connection_t *c)
     rs->session_id = (int)(ngx_time()) & 0xffff;
     rs->rtp_seq = 0;
     rs->rtp_ts = 0;
+
+    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "    assigned session_id=%d", rs->session_id);
 
     /* attach it */
     c->data = rs;
@@ -244,44 +260,94 @@ ngx_rtsp_init_connection(ngx_connection_t *c)
 }
 
 //added function
-
 static void
-ngx_rtsp_send_dummy_rtp(ngx_event_t *rev)
+ngx_rtsp_send_h264_nal(ngx_connection_t   *c,
+                       ngx_rtsp_session_t *rs,
+                       const u_char      *nal, 
+                       size_t             nal_len,
+                       u_char             nal_type,
+                       ngx_uint_t         marker)
 {
-    ngx_connection_t   *c = rev->data;
-    ngx_rtsp_session_t *rs = c->data;
-
-    u_char buf[1500]; // big enough for small RTP + TCP headers
+    u_char  buf[1500];
     u_char *p = buf;
 
-    /* TCP Interleaved Frame Header */
-    *p++ = '$';        // magic byte
-    *p++ = 0;          // channel 0
-    *p++ = 0; *p++ = 12; // payload length = 12 bytes RTP
-
-    /* Minimal Fake RTP Packet (12 bytes header) */
-    *p++ = 0x80;  // Version 2
-    *p++ = 96;    // Payload type 96 (dynamic)
-    *p++ = (rs->rtp_seq >> 8) & 0xff;
-    *p++ = (rs->rtp_seq) & 0xff;
+    //
+    // 1) RTP header (12 bytes)
+    //
+    *p++ = 0x80;                         // V=2, P=0, X=0, CC=0
+    *p++ = (marker ? 0x80 : 0) | 96;     // M=marker, PT=96
+    *p++ = (rs->rtp_seq >> 8) & 0xFF;    // sequence #
+    *p++ = rs->rtp_seq & 0xFF;
     rs->rtp_seq++;
 
-    *p++ = (rs->rtp_ts >> 24) & 0xff;
-    *p++ = (rs->rtp_ts >> 16) & 0xff;
-    *p++ = (rs->rtp_ts >> 8) & 0xff;
-    *p++ = (rs->rtp_ts) & 0xff;
-    rs->rtp_ts += 3600;  // small jump (~1/25 sec assuming 90kHz clock)
+    // timestamp
+    *p++ = (rs->rtp_ts >> 24) & 0xFF;
+    *p++ = (rs->rtp_ts >> 16) & 0xFF;
+    *p++ = (rs->rtp_ts >>  8) & 0xFF;
+    *p++ = rs->rtp_ts & 0xFF;
+    rs->rtp_ts += 3600;                  // e.g. 90000/25fps = 3600
 
-    *p++ = 0x12;  // SSRC dummy
-    *p++ = 0x34;
-    *p++ = 0x56;
-    *p++ = 0x78;
+    // SSRC (fixed)
+    *p++ = 0x12; *p++ = 0x34; *p++ = 0x56; *p++ = 0x78;
 
-    /* Send it */
-    c->send(c, buf, p - buf);
+    //
+    // 2) H.264 NAL header + payload
+    //
+    //    NAL header: F=0, NRI=0 (or set bits 5–6), type=nal_type
+    *p++ = (nal_type & 0x1F);
+    ngx_memcpy(p, nal, nal_len);
+    p += nal_len;
 
-    /* Schedule next send */
-    ngx_add_timer(c->read, 40);
+    //
+    // 3) Interleaved TCP header (“$” + channel + 16-bit BE length)
+    //
+    size_t payload_len = p - buf;
+    u_char ihdr[4];
+    ihdr[0] = 0x24;                     // ‘$’
+    ihdr[1] = (u_char) rs->rtp_channel; // channel (0 for RTP)
+    ihdr[2] = (payload_len >> 8) & 0xFF;
+    ihdr[3] = payload_len & 0xFF;
+
+    //
+    // 4) Send it
+    //
+    c->send(c, ihdr, 4);
+    c->send(c, buf, payload_len);
+
+    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+        "RTSP RTP→TCP ch=%d len=%uz seq=%ui ts=%ui",
+        rs->rtp_channel, payload_len, rs->rtp_seq, rs->rtp_ts);
+}
+
+static void
+ngx_rtsp_send_dummy_rtp(ngx_event_t *ev)
+{
+    ngx_connection_t     *c  = ev->data;
+    ngx_rtsp_session_t   *rs = c->data;
+
+    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+        "RTSP DUMMY RTP callback: seq=%ui, ts=%ui",
+        rs->rtp_seq, rs->rtp_ts);
+
+    /* on first tick, send SPS/PPS */
+    static const u_char dummy_sps[] = {
+        0x67, 0x42, 0x00, 0x1e, 0xe9, 0x01, 0x40, 0x7b,
+        0x20, 0x11, 0x90, 0x00, 0x00, 0x03, 0x00, 0x04
+      };
+      static const u_char dummy_pps[] = {
+        0x68, 0xce, 0x06, 0xe2
+      };
+      static const u_char dummy_idr[] = {
+        0x65, 0x88, 0x84, 0x00, 0x05, 0xff, 0xfb, 0x10
+      };
+
+      if (rs->rtp_seq == 0) {
+        ngx_rtsp_send_h264_nal(c, rs, dummy_sps, sizeof(dummy_sps), 7, 0);
+        ngx_rtsp_send_h264_nal(c, rs, dummy_pps, sizeof(dummy_pps), 8, 1);
+    }
+    else if (rs->rtp_seq == 1) {
+        ngx_rtsp_send_h264_nal(c, rs, dummy_idr, sizeof(dummy_idr), 5, 1);
+    }
 }
 
 static void
@@ -358,38 +424,56 @@ ngx_rtsp_handle_describe(ngx_connection_t *c, int cseq, const char *uri)
 }
 
 static void
-ngx_rtsp_handle_setup(ngx_connection_t *c,
-                      int               cseq,
-                      const char       *buf,
+ngx_rtsp_handle_setup(ngx_connection_t    *c,
+                      int                  cseq,
+                      const char         *raw,
                       ngx_rtsp_session_t *rs)
 {
-    /* build a TCP‐interleaved Transport reply */
-    char extra[128];
+    /* lazy‐init session_id if somehow zero */
+    if (rs->session_id == 0) {
+        rs->session_id = (int)(ngx_time()) & 0xffff;
+        ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                      "RTSP SETUP: lazily init session_id=%d",
+                      rs->session_id);
+    }
 
-    ngx_snprintf((u_char*)extra, sizeof(extra),
+    /* *** FORCE interleaved channels 0 and 1 *** */
+    rs->rtp_channel  = 0;
+    rs->rtcp_channel = 1;
+
+    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                  "RTSP SETUP: forcing interleaved=0-1, session=%d",
+                  rs->session_id);
+
+    /* now reply with exactly 0–1 */
+    u_char extra[128];
+    ngx_snprintf(extra, sizeof(extra),
         "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
         "Session: %d\r\n",
         rs->session_id);
 
-    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", extra);
+    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", (char*)extra);
 }
-
 static void
 ngx_rtsp_handle_play(ngx_connection_t *c,
                      int               cseq,
-                     const char       *buf,
+                     const char       *raw,
                      ngx_rtsp_session_t *rs)
 {
-    /* Validate session… then: */
+    /* send PLAY 200 OK */
     char extra[64];
     ngx_snprintf((u_char*)extra, sizeof(extra),
-        "Session: %d\r\n",
-        rs->session_id);
-
+                 "Session: %d\r\n", rs->session_id);
     ngx_rtsp_send_simple_response(c, cseq, 200, "OK", extra);
 
-    ngx_add_timer(c->read, 40);  // 40ms = 25fps
-    c->read->handler = ngx_rtsp_send_dummy_rtp;
+    /* prepare rtp_event once */
+    rs->rtp_event.handler = ngx_rtsp_send_dummy_rtp;
+    rs->rtp_event.data    = c;
+    rs->rtp_event.log     = c->log;
+    rs->rtp_event.cancelable = 1;
+
+    /* schedule first send in 40ms */
+    ngx_add_timer(&rs->rtp_event, 40);
 }
 
 // added function
@@ -437,7 +521,7 @@ ngx_rtsp_recv(ngx_event_t *rev)
 
     /* extract CSeq first */
     {
-        char *hdr = strstr((char*)buf, "\r\nCSeq:");
+        char *hdr = strstr((char*)buf, "CSeq:");
         if (hdr) {
             char *colon = strchr(hdr, ':');
             if (colon) {
