@@ -27,6 +27,13 @@ typedef struct {
     u_char       rtp_channel;     /* “0” from interleaved=0-1 */
     u_char       rtcp_channel;    /* “1” from interleaved=0-1 */
     ngx_event_t  rtp_event;       /* your 40 ms timer event */
+    u_char       *remote_sdp;       /* pointer to the SDP text from ANNOUNCE */
+    unsigned      recording:1;      /* are we in RECORD mode? */
+    u_char        *fragbuf;          /* buffer for FU‐A assembly */
+    size_t         fraglen;
+    ngx_uint_t     setup_count;    // Track number of SETUPs
+    ngx_uint_t     rtp_audio_channel;
+    ngx_uint_t     rtcp_audio_channel;
 } ngx_rtsp_session_t;
 
 
@@ -44,6 +51,9 @@ static void ngx_rtsp_send_simple_response(ngx_connection_t *c,
     int               code,
     const char       *reason,
     const char       *extra_headers);
+static void ngx_rtsp_recv_rtp_interleaved(ngx_event_t *rev);
+static ssize_t
+parse_content_length(u_char *data, size_t len);
 
 ngx_uint_t                  ngx_rtmp_naccepted;
 
@@ -245,6 +255,12 @@ ngx_rtsp_init_connection(ngx_connection_t *c)
     rs->session_id = (int)(ngx_time()) & 0xffff;
     rs->rtp_seq = 0;
     rs->rtp_ts = 0;
+    rs->fragbuf = NULL;
+    rs->fraglen = 0;
+    rs->remote_sdp = NULL;
+    rs->setup_count = 0;
+    rs->rtp_audio_channel = 2;
+    rs->rtcp_audio_channel = 3;
 
     ngx_log_error(NGX_LOG_WARN, c->log, 0,
                           "    assigned session_id=%d", rs->session_id);
@@ -350,6 +366,55 @@ ngx_rtsp_send_dummy_rtp(ngx_event_t *ev)
     }
 }
 
+static ssize_t
+parse_content_length(u_char *data, size_t len)
+{
+    const char *key   = "Content-Length:";
+    size_t      keylen = ngx_strlen(key);
+    u_char     *p     = data;
+    u_char     *end   = data + len;
+
+    while (p + keylen < end) {
+        if (ngx_strncasecmp(p, (u_char*)key, keylen) == 0) {
+            p += keylen;
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
+            ssize_t v = 0;
+            while (p < end && *p >= '0' && *p <= '9') {
+                v = v * 10 + (*p++ - '0');
+            }
+            return v;
+        }
+        /* skip to next line */
+        while (p < end && *p != '\n') p++;
+        if (p < end) p++;
+    }
+    return -1;
+}
+
+static ngx_int_t
+read_exact(ngx_connection_t *c, u_char *buf, size_t len)
+{
+    ssize_t total = 0;
+    ssize_t n;
+
+    while (total < (ssize_t)len) {
+        n = c->recv(c, buf + total, len - total);
+        
+        if (n == 0) {
+            return NGX_ERROR;
+        }
+        
+        if (n == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+        
+        total += n;
+    }
+
+    return NGX_OK;
+}
+
+
 static void
 ngx_rtsp_send_simple_response(ngx_connection_t *c,
                               int               cseq,
@@ -358,29 +423,26 @@ ngx_rtsp_send_simple_response(ngx_connection_t *c,
                               const char       *extra)
 {
     u_char  buf[1024];
-    size_t  n;
+    u_char *p;
 
-    /*  
-     *  Build the RTSP response:
-     *  RTSP/1.0 <code> <status>\r\n
-     *  CSeq: <cseq>\r\n
-     *  <extra>        (already ends in \r\n…)
-     *  \r\n           (blank line to finish headers)
-     */
-    n = ngx_snprintf(buf, sizeof(buf),
+    // snprintf returns pointer to end of written data
+    p = ngx_snprintf(buf, sizeof(buf),
         "RTSP/1.0 %d %s\r\n"
         "CSeq: %d\r\n"
-        "%s"
-        "\r\n",
+        "%s"           // extra headers, already ending in "\r\n"
+        "\r\n",       // blank line
         code, status,
         cseq,
-        extra ? extra : "")
-        - buf;
+        extra ? extra : "");
 
-    /* send it back on the TCP control socket */
+    // length is end minus start
+    size_t n = p - buf;
+
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+                  "RTSP → send response: %*s", n, buf);
+
     c->send(c, buf, n);
 }
-
 // function to handle options
 
 // OPTIONS: advertise which methods we support
@@ -398,29 +460,40 @@ ngx_rtsp_handle_options(ngx_connection_t *c, int cseq)
 static void
 ngx_rtsp_handle_describe(ngx_connection_t *c, int cseq, const char *uri)
 {
-    static const char *sdp =
+    u_char  sdp_buf[1024];
+    u_char  extra[256];
+    u_char *p;
+    size_t  n;
+
+    /* Build the SDP payload */
+    const char *server_ip = "127.0.0.1";  /* replace with actual IP detection */
+
+    /* ngx_snprintf returns a pointer to the end of data written */
+    p = ngx_snprintf(sdp_buf, sizeof(sdp_buf),
         "v=0\r\n"
-        "o=- 0 0 IN IP4 127.0.0.1\r\n"
-        "s=nginx-rtsp\r\n"
-        "t=0 0\r\n"
+        "o=- 0 0 IN IP4 %s\r\n"
+        "s=Stream\r\n"
         "a=control:*\r\n"
         "m=video 0 RTP/AVP 96\r\n"
         "a=rtpmap:96 H264/90000\r\n"
-        "a=control:trackID=0\r\n";
+        "a=control:trackID=0\r\n"
+        "m=audio 0 RTP/AVP 97\r\n"
+        "a=rtpmap:97 mpeg4-generic/48000/2\r\n"
+        "a=control:trackID=1\r\n",
+        server_ip);
 
-    /* Build headers (no blank line yet) */
-    char extra[256];
+    /* compute actual length */
+    n = p - sdp_buf;
 
-    ngx_snprintf((u_char*)extra, sizeof(extra),
+    /* prepare headers, using %uz for a size_t */
+    ngx_snprintf(extra, sizeof(extra),
         "Content-Type: application/sdp\r\n"
         "Content-Length: %uz\r\n",
-        ngx_strlen(sdp));
+        n);
 
-    /* Send the RTSP status + headers + blank line */
-    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", extra);
-
-    /* Send the SDP body */
-    c->send(c, (u_char*)sdp, ngx_strlen(sdp));
+    /* send RTSP response and the SDP body */
+    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", (char*)extra);
+    c->send(c, sdp_buf, n);
 }
 
 static void
@@ -437,23 +510,41 @@ ngx_rtsp_handle_setup(ngx_connection_t    *c,
                       rs->session_id);
     }
 
-    /* *** FORCE interleaved channels 0 and 1 *** */
-    rs->rtp_channel  = 0;
-    rs->rtcp_channel = 1;
+    /* NEW: Track setup count per session */
+    if (rs->setup_count % 2 == 0) {
+        // First setup (video): channels 0-1
+        rs->rtp_channel = 0;
+        rs->rtcp_channel = 1;
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+                      "SETUP: assigned video channels %d-%d",
+                      rs->rtp_channel, rs->rtcp_channel);
+    } else {
+        // Second setup (audio): channels 2-3
+        rs->rtp_channel = 2;
+        rs->rtcp_channel = 3;
+        ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+                      "SETUP: assigned audio channels %d-%d",
+                      rs->rtp_channel, rs->rtcp_channel);
+    }
+    rs->setup_count++;
 
+    /* Modified logging */
     ngx_log_error(NGX_LOG_WARN, c->log, 0,
-                  "RTSP SETUP: forcing interleaved=0-1, session=%d",
-                  rs->session_id);
+                  "RTSP SETUP: interleaved=%d-%d, session=%d",
+                  rs->rtp_channel, rs->rtcp_channel, rs->session_id);
 
-    /* now reply with exactly 0–1 */
+    /* Updated Transport header */
     u_char extra[128];
     ngx_snprintf(extra, sizeof(extra),
-        "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+        "Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d\r\n"
         "Session: %d\r\n",
+        rs->rtp_channel, rs->rtcp_channel,  // Dynamic channels
         rs->session_id);
 
     ngx_rtsp_send_simple_response(c, cseq, 200, "OK", (char*)extra);
 }
+
+
 static void
 ngx_rtsp_handle_play(ngx_connection_t *c,
                      int               cseq,
@@ -474,6 +565,92 @@ ngx_rtsp_handle_play(ngx_connection_t *c,
 
     /* schedule first send in 40ms */
     ngx_add_timer(&rs->rtp_event, 40);
+}
+
+static void
+ngx_rtsp_handle_announce(ngx_connection_t *c, int cseq, u_char *raw, ssize_t raw_len)
+{
+    ngx_rtsp_session_t *rs = c->data;
+    u_char             *hdr_end, *body_start;
+    size_t              header_len, got_in_buf, to_read;
+    ssize_t             clen;
+    u_char             *sdp_buf;
+    char               *hdr_end_c;
+
+    /* 1) find end of headers: "\r\n\r\n" */
+    hdr_end_c = strstr((char*) raw, "\r\n\r\n");
+    if (hdr_end_c == NULL) {
+        ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
+        return;
+    }
+    hdr_end     = (u_char*) hdr_end_c;
+    body_start  = hdr_end + 4;
+    header_len  = body_start - raw;
+    got_in_buf  = raw_len     - header_len;
+
+    if (!hdr_end) {
+        ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
+        return;
+    }
+    body_start = hdr_end + 4;
+    header_len = body_start - raw;
+    got_in_buf = raw_len - header_len;
+
+    // 2) parse Content-Length
+    clen = parse_content_length(raw, header_len);
+    if (clen <= 0) {
+        ngx_rtsp_send_simple_response(c, cseq, 411, "Length Required", NULL);
+        return;
+    }
+
+    // 3) allocate full buffer
+    sdp_buf = ngx_palloc(c->pool, clen + 1);
+    if (!sdp_buf) {
+        ngx_rtsp_send_simple_response(c, cseq, 500, "Internal Server Error", NULL);
+        return;
+    }
+
+    // 4) copy the portion already in 'raw'
+    if (got_in_buf > 0) {
+        if (got_in_buf > (size_t)clen) {
+            got_in_buf = clen;
+        }
+        ngx_memcpy(sdp_buf, body_start, got_in_buf);
+    }
+
+    // 5) read the *rest* from the socket
+    to_read = (size_t)clen - got_in_buf;
+    if (to_read) {
+        if (read_exact(c, sdp_buf + got_in_buf, to_read) != NGX_OK) {
+            ngx_rtsp_send_simple_response(c, cseq, 400, "Bad Request", NULL);
+            return;
+        }
+    }
+
+    sdp_buf[clen] = '\0';
+    rs->remote_sdp = sdp_buf;
+
+    // 6) OK, complete ANNOUNCE
+    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", NULL);
+}
+
+static void
+ngx_rtsp_handle_record(ngx_connection_t *c, int cseq, ngx_rtsp_session_t *rs)
+{
+    // Reply OK, echo Session header
+    char extra[64];
+    ngx_snprintf((u_char*)extra, sizeof(extra),
+                 "Session: %d\r\n", rs->session_id);
+    ngx_rtsp_send_simple_response(c, cseq, 200, "OK", extra);
+
+    // Mark that we’re now in “recording” mode
+    rs->recording = 1;
+
+    // Switch the control‐plane read handler into an RTP‐over‐TCP parser
+    c->read->handler = ngx_rtsp_recv_rtp_interleaved;
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_close_connection(c);
+    }
 }
 
 // added function
@@ -554,6 +731,12 @@ ngx_rtsp_recv(ngx_event_t *rev)
     else if (strcmp(method, "PLAY") == 0) {
         ngx_rtsp_handle_play(c, cseq, (char *) raw, rs);
     }
+    else if (strcmp(method, "ANNOUNCE") == 0) {
+        ngx_rtsp_handle_announce(c, cseq, raw, idx);
+    }
+    else if (strcmp(method, "RECORD") == 0) {
+        ngx_rtsp_handle_record(c, cseq, rs);
+    }
     else {
         ngx_rtsp_send_simple_response(c, cseq, 501,
                                       "Not Implemented", NULL);
@@ -568,6 +751,82 @@ ngx_rtsp_recv(ngx_event_t *rev)
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
             ngx_close_connection(c);
         }
+    }
+}
+
+static void
+ngx_rtsp_recv_rtp_interleaved(ngx_event_t *rev)
+{
+    ngx_connection_t   *c = rev->data;
+    ngx_rtsp_session_t *rs = c->data;
+    u_char              ihdr[4];
+    ssize_t             n;
+
+    // 1) pull in the 4‐byte interleaved header
+    n = c->recv(c, ihdr, 4);
+    if (n != 4 || ihdr[0] != '$') {
+        // not an RTP packet? fall back to control parsing or close
+        ngx_rtsp_recv(rev);
+        return;
+    }
+    int channel = ihdr[1];
+    (void)channel;  // suppress unused warning
+    int plen    = (ihdr[2] << 8) | ihdr[3];
+
+    // 2) read the full RTP packet
+    u_char *pkt = ngx_palloc(c->pool, plen);
+    n = c->recv(c, pkt, plen);
+    if (n != plen) {
+        ngx_close_connection(c);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0, 
+        "RTP packet: channel=%d len=%d", channel, plen);
+
+    // 3) strip RTP header (12 bytes)
+    u_char *rtp_payload = pkt + 12;
+    size_t payload_len  = plen - 12;
+    u_char nal_type     = rtp_payload[0] & 0x1F;
+
+    // 4) handle single‐NAL vs FU-A fragmentation
+    if (nal_type == 28 /* FU-A */) {
+        u_char fu_header = rtp_payload[1];
+        u_char start     = fu_header & 0x80;
+        u_char end       = fu_header & 0x40;
+        u_char orig_type = fu_header & 0x1F;
+
+        if (start) {
+            // allocate new frag buffer, prepend reconstructed NAL header
+            rs->fraglen = 1;
+            rs->fragbuf = ngx_palloc(c->pool, payload_len + 4);
+            rs->fragbuf[0] = (rtp_payload[0] & 0xE0) | orig_type;
+            ngx_memcpy(rs->fragbuf + 1, rtp_payload + 2, payload_len - 2);
+            rs->fraglen += (payload_len - 2);
+        } else {
+            // append payload
+            u_char *new_buf = ngx_palloc(c->pool, rs->fraglen + payload_len - 2);
+            ngx_memcpy(new_buf, rs->fragbuf, rs->fraglen);
+            ngx_memcpy(new_buf + rs->fraglen, rtp_payload + 2, payload_len - 2);
+            rs->fragbuf = new_buf;
+            ngx_memcpy(rs->fragbuf + rs->fraglen, rtp_payload + 2, payload_len - 2);
+            rs->fraglen += (payload_len - 2);
+        }
+        if (end) {
+            // complete—send it out
+            ngx_rtsp_send_h264_nal(c, rs, rs->fragbuf, rs->fraglen, orig_type, 1);
+            rs->fraglen = 0;
+        }
+    }
+    else {
+        // simple, single‐NAL packet
+         u_char marker = (ihdr[1] & 0x80) != 0;
+         ngx_rtsp_send_h264_nal(c, rs, rtp_payload, payload_len, nal_type, marker);
+    }
+
+    // 5) re-arm to keep pulling more RTP
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_close_connection(c);
     }
 }
 
