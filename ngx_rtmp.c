@@ -10,8 +10,7 @@
 #include <nginx.h>
 #include "ngx_rtmp.h"
 
-// added extern
-extern void ngx_rtsp_init_connection(ngx_connection_t *c);
+#include "ngx_rtsp_module.h"
 
 static char *ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_rtmp_add_ports(ngx_conf_t *cf, ngx_array_t *ports,
@@ -80,7 +79,6 @@ ngx_module_t  ngx_rtmp_module = {
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
-
 
 static char *
 ngx_rtmp_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
@@ -664,8 +662,6 @@ ngx_rtmp_optimize_servers(ngx_conf_t *cf, ngx_array_t *ports)
                 ls->handler = ngx_rtmp_init_connection;
             }
             /* ── END PORT CHECK ── */
-
-
             ls->pool_size = 4096;
 
             /* TODO: error_log directive */
